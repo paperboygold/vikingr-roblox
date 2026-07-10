@@ -14,6 +14,10 @@ local Vikingr = ReplicatedStorage:WaitForChild("Vikingr")
 local FluidSim = require(Vikingr:WaitForChild("FluidSim"))
 local WorldSpec = require(Vikingr:WaitForChild("WorldSpec"))
 
+if not WorldSpec.Config.enableFluidParticleDemo then
+	return
+end
+
 local player = Players.LocalPlayer
 local char = player.Character or player.CharacterAdded:Wait()
 local root = char:WaitForChild("HumanoidRootPart")

@@ -20,6 +20,8 @@ export type Config = {
 	lakeCount: number,
 	terrainMode: string,
 	voxelChunksPerYield: number,
+	waterRenderer: "terrain" | "custom",
+	enableFluidParticleDemo: boolean,
 }
 
 WorldSpec.Config = {
@@ -39,6 +41,10 @@ WorldSpec.Config = {
 	lakeCount = 10,
 	terrainMode = "voxels",
 	voxelChunksPerYield = 4,
+	-- Production water has one owner. "custom" is retained for solver experiments but
+	-- must own ocean, rivers, lakes, swimming, and observation before it can ship.
+	waterRenderer = "terrain",
+	enableFluidParticleDemo = false,
 }
 
 function WorldSpec.cloneConfig(overrides: { [string]: any }?): Config
@@ -98,6 +104,13 @@ end
 -- the shape constants each field module reads. Grouped by stage.
 -- ═══════════════════════════════════════════════════════════════════════════
 WorldSpec.Tuning = {
+	terrainWater = {
+		color = Color3.fromRGB(28, 120, 158),
+		transparency = 0.22,
+		reflectance = 0.08,
+		waveSize = 0.18,
+		waveSpeed = 9,
+	},
 	continent = {
 		-- Sea corridor runs along z (width 112 > depth 82 → widest cross-sea reach).
 		channelX0Range = { -8, 8 }, -- centerline base offset (cells)

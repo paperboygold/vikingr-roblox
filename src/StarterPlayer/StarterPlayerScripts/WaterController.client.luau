@@ -18,6 +18,14 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local WorldSpec = require(ReplicatedStorage:WaitForChild("Vikingr"):WaitForChild("WorldSpec"))
+if WorldSpec.Config.waterRenderer ~= "custom" then
+	-- Terrain water owns swimming in the production render plan. Roblox's Humanoid
+	-- controller already enters and leaves Swimming from voxel occupancy.
+	return
+end
 
 local SHORE_STAND = 4.2 -- leave swimming when ground is within this many studs under the feet
 local ENTER_DEPTH = 2.0 -- studs under the local wave surface before entering water

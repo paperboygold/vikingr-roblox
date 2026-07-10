@@ -21,6 +21,10 @@ local WorldSpec = require(ReplicatedStorage:WaitForChild("Vikingr"):WaitForChild
 local cfg = WorldSpec.Config
 local SEA = cfg.seaLevel
 
+if cfg.waterRenderer ~= "custom" then
+	return
+end
+
 -- clean up any leftover stopgap backdrop from earlier builds
 local stale = workspace:FindFirstChild("OceanFarBase")
 if stale then

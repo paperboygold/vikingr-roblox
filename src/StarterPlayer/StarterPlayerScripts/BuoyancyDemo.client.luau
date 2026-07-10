@@ -6,6 +6,12 @@
 -- and buoyancy. A physics-force version plugs into the same Ocean:heightAt/normalAt.
 
 local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local WorldSpec = require(ReplicatedStorage:WaitForChild("Vikingr"):WaitForChild("WorldSpec"))
+if WorldSpec.Config.waterRenderer ~= "custom" then
+	return
+end
 
 while _G.VikingrOcean == nil do
 	task.wait()

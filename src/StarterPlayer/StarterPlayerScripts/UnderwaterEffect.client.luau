@@ -8,6 +8,12 @@
 local RunService = game:GetService("RunService")
 local Lighting = game:GetService("Lighting")
 local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local WorldSpec = require(ReplicatedStorage:WaitForChild("Vikingr"):WaitForChild("WorldSpec"))
+if WorldSpec.Config.waterRenderer ~= "custom" then
+	return
+end
 
 local cc = Instance.new("ColorCorrectionEffect")
 cc.Name = "UnderwaterCC"

@@ -156,7 +156,9 @@ local function makeVoxelChunk(
 					end
 				end
 
-				if waterKind ~= nil and waterKind ~= "sea" then
+				-- Native Terrain owns the whole visible body: sea, rivers, and lakes. The
+				-- custom branch writes no Terrain water, avoiding two overlapping surfaces.
+				if waterKind ~= nil and config.waterRenderer == "terrain" then
 					if worldY <= waterHeight and occupancy < 0.95 then
 						material = Enum.Material.Water
 						occupancy = math.max(occupancy, math.clamp((waterHeight - worldY) / resolution + 0.5, 0, 1))
@@ -232,6 +234,12 @@ function TerrainWriter.write(config: WorldSpec.Config, state: ChunkStore.State, 
 	Lighting.Brightness = 2
 	Lighting.EnvironmentDiffuseScale = 0.6
 	Lighting.EnvironmentSpecularScale = 0.4
+	local terrainWater = WorldSpec.Tuning.terrainWater
+	workspace.Terrain.WaterColor = terrainWater.color
+	workspace.Terrain.WaterTransparency = terrainWater.transparency
+	workspace.Terrain.WaterReflectance = terrainWater.reflectance
+	workspace.Terrain.WaterWaveSize = terrainWater.waveSize
+	workspace.Terrain.WaterWaveSpeed = terrainWater.waveSpeed
 	pcall(function()
 		workspace.StreamingEnabled = true
 	end)
@@ -254,11 +262,8 @@ function TerrainWriter.write(config: WorldSpec.Config, state: ChunkStore.State, 
 	local chunkCountX = math.ceil(config.width / chunkCells)
 	local chunkCountZ = math.ceil(config.depth / chunkCells)
 
-	-- Every chunk is voxelized now — land AND seabed both have real terrain (ReliefField's
-	-- underwater relief), so there is no "empty" chunk to skip the way pure-water chunks
-	-- used to be. No blanket FillBlock either: each chunk's own WriteVoxels paints Water
-	-- material from its real seabed up to sea level (the same occupancy logic that already
-	-- handled coastal shorelines).
+	-- Every chunk is voxelized: land and seabed remain real Terrain. In the native render
+	-- plan, the same chunk write fills ocean, river, and lake columns to their field surface.
 	for chunkX = 0, chunkCountX - 1 do
 		for chunkZ = 0, chunkCountZ - 1 do
 			local startX = -halfW + chunkX * chunkCells
@@ -328,12 +333,14 @@ function TerrainWriter.writeColumns(config: WorldSpec.Config, state: ChunkStore.
 	}
 
 	local worldSize = Vector3.new(config.width * config.cellSize, config.waterDepth, config.depth * config.cellSize)
-	workspace.Terrain:FillBlock(
-		CFrame.new(0, config.seaLevel - config.waterDepth / 2, 0),
-		worldSize,
-		Enum.Material.Water
-	)
-	stats.terrainWrites += 1
+	if config.waterRenderer == "terrain" then
+		workspace.Terrain:FillBlock(
+			CFrame.new(0, config.seaLevel - config.waterDepth / 2, 0),
+			worldSize,
+			Enum.Material.Water
+		)
+		stats.terrainWrites += 1
+	end
 
 	Hash.iterDict(state.chunks, nil, function(_, _chunkKey, cells)
 		stats.chunks += 1

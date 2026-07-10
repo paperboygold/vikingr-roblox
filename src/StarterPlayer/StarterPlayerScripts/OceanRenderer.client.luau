@@ -19,6 +19,9 @@ local WorldSpec = require(Vikingr:WaitForChild("WorldSpec"))
 
 local N, SP = 96, 21 -- 2016 studs, finer shore quantization while keeping startup/mesh cost bounded
 local config = WorldSpec.Config
+if config.waterRenderer ~= "custom" then
+	return
+end
 local SEA = config.seaLevel
 local HALF = N / 2 * SP
 

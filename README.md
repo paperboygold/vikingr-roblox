@@ -25,6 +25,10 @@ require(game.ServerScriptService.Vikingr.Map).BenchScenarios()
 
 `Workspace.VikingrClearTerrainWaterForOceanMesh = true` enables the legacy ocean-mesh-only cleanup that removes terrain `Water` voxels. Leave it unset by default: Roblox `ReplaceMaterial` is region-wide, so this pass can also remove inland lake and river water.
 
+Production rendering uses one native Roblox Terrain water body for ocean, rivers, and lakes. `WorldSpec.Config.waterRenderer` defaults to `"terrain"`; this also leaves swimming to Roblox's native Humanoid controller. The conservative custom ocean remains in source for experiments, but setting the renderer to `"custom"` is not a production configuration until it owns every water surface and supplies a certified cell-to-mesh reconstruction.
+
+The particle-fluid visual demo is separately disabled by default through `WorldSpec.Config.enableFluidParticleDemo`.
+
 ## Windows handoff
 
 Install Roblox Studio and the Rojo Studio plugin on the Windows machine. Install the Rojo CLI from the [Rojo releases](https://github.com/rojo-rbx/rojo/releases) page and make sure `rojo.exe` is available in PowerShell.
