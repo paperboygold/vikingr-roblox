@@ -130,7 +130,10 @@ WorldSpec.Tuning = {
 
 		-- continentality (C) → base elevation
 		landHeight = 26, -- studs of land rise at full continentality
-		pLand = 1.6, -- >1 → shallow coastal plain near shore, steeper inland
+		-- A finite waterline grade gives a surge a gravitational return path. The old
+		-- exponent (>1) forced zero slope at sea level, so even a modest wave could
+		-- spread across several cells of artificial coastal flat.
+		pLand = 1.0,
 		cLand = 1.0, -- C at which land reaches full landHeight
 		shelfDrop = 14, -- studs the shelf sinks before deep ocean
 		cShelf = 0.6, -- |C| at which shelf reaches deep ocean
@@ -265,4 +268,3 @@ function WorldSpec.walkSeconds(config: Config, cells: number): number
 end
 
 return WorldSpec
-

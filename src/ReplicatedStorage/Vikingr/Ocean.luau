@@ -3,10 +3,10 @@
 
 -- Ocean — conservative shallow-water cells over live bathymetry.
 --
--- Primitive state is water column H plus horizontal momentum qx/qz. Velocity,
--- free-surface height, mesh deformation, and foam are derived reads. Internal
--- faces exchange one available-mass-limited parcel with equal/opposite mass and
--- momentum writes; the exact H=0 Null seam can receive flux and become wet.
+-- Primitive state is water column H, horizontal momentum qx/qz, and entrained-air
+-- tracer F. Velocity and free-surface height are derived reads. Internal faces
+-- exchange one available-mass-limited parcel with equal/opposite mass, momentum,
+-- and tracer writes; the exact H=0 Null seam can receive flux and become wet.
 
 local Ocean = {}
 Ocean.__index = Ocean
@@ -46,9 +46,6 @@ function Ocean.new(opts: { [string]: any }): Ocean
 	self.seaLevel = opts.seaLevel or 12
 	self.originX = opts.originX or 0
 	self.originZ = opts.originZ or 0
-	-- cc = (wave speed · dt / dx)². Small on purpose: this sets a realistic (slow) wave
-	-- speed (~24 studs/s → ~11 s swell period). Large cc = the twitchy "instant" waves.
-	self.ccMax = opts.ccMax or 0.0012
 	-- Lower than before: with boundary-driven forcing, energy injected upwind has to
 	-- actually CARRY across the visible patch to reach the coast — the old higher damping
 	-- was tuned for the everywhere-forced regime and starved the downwind/coastal water.
@@ -61,17 +58,22 @@ function Ocean.new(opts: { [string]: any }): Ocean
 	self.swellHeight = opts.swellHeight or (self.windStrength * 3.2)
 	self.boundaryRelax = opts.boundaryRelax or 3.0
 	self.gravity = opts.gravity or workspace.Gravity
+	-- The incoming spectrum is evaluated at a physical reference depth. The local
+	-- finite-volume step still reads the real bathymetry face-by-face.
+	self.referenceDepth = opts.referenceDepth or self.spacing
 
 	local sz = N * N
 	self.h = filled(sz, 0)
 	self.water = filled(sz, 0)
 	self.qx = filled(sz, 0)
 	self.qz = filled(sz, 0)
+	self.foam = filled(sz, 0)
 	self.u = filled(sz, 0)
 	self.v = filled(sz, 0)
 	self.flux = filled(sz, 0)
 	self.fluxQx = filled(sz, 0)
 	self.fluxQz = filled(sz, 0)
+	self.fluxFoam = filled(sz, 0)
 	self.outflow = filled(sz, 0)
 	self.wet = table.create(sz, true)
 	self.breaking = filled(sz, 0)
@@ -85,37 +87,44 @@ function Ocean.new(opts: { [string]: any }): Ocean
 	return self
 end
 
--- A BROADBAND directional spectrum (~20 components spanning big swell down to short wind
--- chop), each a genuine traveling wave on the PDE's own dispersion relation ω = c·k. One
+-- A BROADBAND directional spectrum spanning big swell down to resolved wind chop. Each
+-- component has a genuine traveling-wave phase, so the field self-interferes across scales.
 -- field, self-interfering across scales — this is the scale-invariant read (ObserverScale:
 -- x=B/U is the same structure at coarse and fine frame), not a coarse-wave-plus-bolted-on-
 -- noise-chop split. With enough incommensurate wavelengths/directions/phases, the
 -- superposition is aperiodic-looking (real beat/interference, no fbm/Perlin anywhere) —
 -- "authored noise is a seam"; here the seam is closed by drawing every component
 -- deterministically from the seed (hashRange), the seed=prediction+residual pattern.
-local SPECTRUM_N = 20
-local WAVELEN_MIN, WAVELEN_MAX = 14, 620 -- short wind-chop .. big ocean swell (studs)
+local SPECTRUM_N = 14
+-- A finite-volume wave needs several cells per crest-to-crest period. Components below this
+-- limit alias into the regular, stationary-looking ripples that the renderer cannot recover.
+local MIN_CELLS_PER_WAVELENGTH = 4
+local PATCH_WAVELENGTH_FRACTION = 0.62
 local DIR_SPREAD = 1.1 -- radians either side of the wind heading
 
 function Ocean.buildSpectrum(self: Ocean)
-	local dtRef = 1 / 30
-	local c = math.sqrt(self.ccMax) * self.spacing / dtRef -- wave speed (studs/s)
+	local wavelengthMin = self.spacing * MIN_CELLS_PER_WAVELENGTH
+	local wavelengthMax = math.max(wavelengthMin * 1.25, self.spacing * self.N * PATCH_WAVELENGTH_FRACTION)
+	local referenceDepth = math.max(1e-4, self.referenceDepth)
 	self.spectrum = {}
 	for i = 1, SPECTRUM_N do
 		-- log-spaced wavelength draw so short and long scales are both well represented
 		local u = hashRange(self.seed, i * 3 + 1, 0, 1)
-		local wavelength = WAVELEN_MIN * (WAVELEN_MAX / WAVELEN_MIN) ^ u
+		local wavelength = wavelengthMin * (wavelengthMax / wavelengthMin) ^ u
 		local dirOff = hashRange(self.seed, i * 3 + 2, -DIR_SPREAD, DIR_SPREAD)
 		local phase = hashRange(self.seed, i * 3 + 3, 0, 2 * math.pi)
 		-- energy falls off toward short wavelengths (Pierson-Moskowitz-shaped): big swells
 		-- dominate, chop rides on top with less amplitude but adds the churn/texture
-		local amp = (wavelength / WAVELEN_MAX) ^ 0.85
+		local amp = (wavelength / wavelengthMax) ^ 0.85
 		local dir = self.windAngle + dirOff
 		local k = 2 * math.pi / wavelength
+		-- Linear gravity-wave dispersion at the open boundary. The depth is explicit
+		-- rather than being hidden in an animation speed constant.
+		local omega = math.sqrt(self.gravity * k * math.tanh(k * referenceDepth))
 		table.insert(self.spectrum, {
 			kx = math.cos(dir) * k,
 			kz = math.sin(dir) * k,
-			omega = c * k,
+			omega = omega,
 			amp = amp,
 			phase = phase,
 		})
@@ -145,7 +154,7 @@ function Ocean.setDepth(self: Ocean, depthFn: (number, number) -> number)
 		self.groundY = filled(N * N, -1e4)
 	end
 	local water, wet = self.water, self.wet
-	local qx, qz, u, v = self.qx, self.qz, self.u, self.v
+	local qx, qz, foam, u, v = self.qx, self.qz, self.foam, self.u, self.v
 	for i = 0, N - 1 do
 		for j = 0, N - 1 do
 			local depth = depthFn(self.originX + i * sp, self.originZ + j * sp)
@@ -163,6 +172,7 @@ function Ocean.setDepth(self: Ocean, depthFn: (number, number) -> number)
 				self.h[c] = 0
 				qx[c] = 0
 				qz[c] = 0
+				foam[c] = 0
 				u[c] = 0
 				v[c] = 0
 				self.breaking[c] = 0
@@ -270,11 +280,12 @@ function Ocean.recenter(self: Ocean, targetX: number, targetZ: number, depthFn: 
 		return
 	end
 	local h, breaking = self.h, self.breaking
-	local water, qx, qz, u, v = self.water, self.qx, self.qz, self.u, self.v
+	local water, qx, qz, foam, u, v = self.water, self.qx, self.qz, self.foam, self.u, self.v
 	local nh = table.create(N * N, 0)
 	local nb = table.create(N * N, 0)
 	local nw = table.create(N * N, 0)
 	local nqx, nqz = table.create(N * N, 0), table.create(N * N, 0)
+	local nf = table.create(N * N, 0)
 	local nu, nv = table.create(N * N, 0), table.create(N * N, 0)
 	for i = 0, N - 1 do
 		local oi = i + di
@@ -287,6 +298,7 @@ function Ocean.recenter(self: Ocean, targetX: number, targetZ: number, depthFn: 
 				nw[nidx] = water[oidx]
 				nqx[nidx] = qx[oidx]
 				nqz[nidx] = qz[oidx]
+				nf[nidx] = foam[oidx]
 				nu[nidx] = u[oidx]
 				nv[nidx] = v[oidx]
 			end
@@ -294,7 +306,7 @@ function Ocean.recenter(self: Ocean, targetX: number, targetZ: number, depthFn: 
 	end
 	self.h = nh
 	self.breaking = nb
-	self.water, self.qx, self.qz = nw, nqx, nqz
+	self.water, self.qx, self.qz, self.foam = nw, nqx, nqz, nf
 	self.u, self.v = nu, nv
 	self.originX += di * sp
 	self.originZ += dj * sp
@@ -309,8 +321,8 @@ function Ocean.step(self: Ocean, dt: number)
 	if groundY == nil then
 		return
 	end
-	local qx, qz, u, v = self.qx, self.qz, self.u, self.v
-	local flux, fluxQx, fluxQz, outflow = self.flux, self.fluxQx, self.fluxQz, self.outflow
+	local qx, qz, foam, u, v = self.qx, self.qz, self.foam, self.u, self.v
+	local flux, fluxQx, fluxQz, fluxFoam, outflow = self.flux, self.fluxQx, self.fluxQz, self.fluxFoam, self.outflow
 	local drag = math.exp(-self.damping * dt)
 	local accel = self.gravity * dt / (2 * sp)
 	self.t += dt
@@ -351,6 +363,7 @@ function Ocean.step(self: Ocean, dt: number)
 		flux[c] = 0
 		fluxQx[c] = 0
 		fluxQz[c] = 0
+		fluxFoam[c] = 0
 		outflow[c] = 0
 	end
 
@@ -383,10 +396,13 @@ function Ocean.step(self: Ocean, dt: number)
 			local parcelFraction = amount / donorH
 			local parcelQx = qx[donor] * parcelFraction
 			local parcelQz = qz[donor] * parcelFraction
+			local parcelFoam = foam[donor] * parcelFraction
 			fluxQx[donor] -= parcelQx
 			fluxQx[receiver] += parcelQx
 			fluxQz[donor] -= parcelQz
 			fluxQz[receiver] += parcelQz
+			fluxFoam[donor] -= parcelFoam
+			fluxFoam[receiver] += parcelFoam
 		else
 			outflow[donor] += amount
 		end
@@ -415,11 +431,13 @@ function Ocean.step(self: Ocean, dt: number)
 		water[c] = H
 		qx[c] += fluxQx[c]
 		qz[c] += fluxQz[c]
+		foam[c] = math.min(H, math.max(0, foam[c] + fluxFoam[c]))
 		if H <= DRY_EPS then
 			wet[c] = false
 			h[c] = 0
 			qx[c] = 0
 			qz[c] = 0
+			foam[c] = 0
 			u[c] = 0
 			v[c] = 0
 		else
@@ -430,7 +448,27 @@ function Ocean.step(self: Ocean, dt: number)
 		end
 	end
 
+	self:decayFoam(dt)
 	self:updateBreaking(dt)
+end
+
+-- Entrained air is a material carrier, not a height threshold in the renderer. Its
+-- residence time is the local gravity-wave crossing time of one solver cell; when its
+-- carrier depth reaches the dry Null seam, the tracer is exactly absent as well.
+function Ocean.decayFoam(self: Ocean, dt: number)
+	local water, foam, u, v = self.water, self.foam, self.u, self.v
+	local g, spacing = self.gravity, self.spacing
+	for c = 1, self.N * self.N do
+		local H = water[c]
+		if H <= DRY_EPS then
+			foam[c] = 0
+		else
+			local speed = math.sqrt(u[c] * u[c] + v[c] * v[c])
+			local gravitySpeed = math.sqrt(math.max(0, g * H))
+			local turnover = (speed + gravitySpeed) / spacing
+			foam[c] = math.min(H, foam[c] * math.exp(-turnover * dt))
+		end
+	end
 end
 
 -- Wind spectrum body force. The "gust" is a deterministic multi-sine breathing of the
@@ -498,10 +536,11 @@ function Ocean.applyForcing(self: Ocean, dt: number)
 end
 
 -- Characteristic collapse at Froude one. Supercritical horizontal momentum is
--- projected to |q|^2 = g H^3; the removed squared-momentum fraction is the foam
--- readout. No velocity or depth division occurs at the dry Null seam.
-function Ocean.updateBreaking(self: Ocean, _dt: number)
-	local water, qx, qz = self.water, self.qx, self.qz
+-- projected to |q|^2 = g H^3. The irreversible projection produces entrained air at
+-- the local gravity-wave turnover rate; the renderer reads that carried concentration,
+-- never the instantaneous projection ratio itself.
+function Ocean.updateBreaking(self: Ocean, dt: number)
+	local water, qx, qz, foam = self.water, self.qx, self.qz, self.foam
 	local u, v, breaking = self.u, self.v, self.breaking
 	local gravity = self.gravity
 	for c = 1, self.N * self.N do
@@ -513,11 +552,14 @@ function Ocean.updateBreaking(self: Ocean, _dt: number)
 			local characteristicSq = gravity * H * H * H
 			if momentumSq > characteristicSq then
 				local scale = math.sqrt(characteristicSq / momentumSq)
-				qx[c] *= scale
-				qz[c] *= scale
-				u[c] = qx[c] / H
-				v[c] = qz[c] / H
-				breaking[c] = 1 - characteristicSq / momentumSq
+			qx[c] *= scale
+			qz[c] *= scale
+			u[c] = qx[c] / H
+			v[c] = qz[c] / H
+			breaking[c] = 1 - characteristicSq / momentumSq
+			local speed = math.sqrt(u[c] * u[c] + v[c] * v[c])
+			local turnover = (speed + math.sqrt(gravity * H)) / self.spacing
+			foam[c] = math.min(H, foam[c] + H * breaking[c] * turnover * dt)
 			else
 				breaking[c] = 0
 			end
