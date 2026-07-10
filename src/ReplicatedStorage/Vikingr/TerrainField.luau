@@ -19,6 +19,7 @@
 -- clamp keeps beaches gentle at the land/sea boundary.
 
 local WorldSpec = require(script.Parent.WorldSpec)
+local Hash = require(script.Parent.Hash)
 local FieldMap = require(script.Parent.FieldMap)
 local ContinentField = require(script.Parent.ContinentField)
 local ReliefField = require(script.Parent.ReliefField)
@@ -26,6 +27,7 @@ local ClimateField = require(script.Parent.ClimateField)
 local Hydrology = require(script.Parent.Hydrology)
 local Erosion = require(script.Parent.Erosion)
 local WaterSim = require(script.Parent.WaterSim)
+local WaterField = require(script.Parent.WaterField)
 local RegimeField = require(script.Parent.RegimeField)
 local SiteField = require(script.Parent.SiteField)
 
@@ -39,6 +41,7 @@ export type State = {
 	rp: ReliefField.Params,
 	regime: RegimeField.State,
 	sites: SiteField.State,
+	waterField: WaterField.State,
 	featureCounts: { [string]: number },
 	regimeCounts: { [string]: number },
 	altitudeStats: { [string]: number },
@@ -54,6 +57,21 @@ local function isLand(fm: FieldMap.FieldMap, x: number, z: number): boolean
 	return FieldMap.hasMask(fm, "land", cellKey(x, z))
 end
 
+-- Only the one-cell mixed coast halo pays for the implicit boundary. Homogeneous interior
+-- cells retain the dense mask lookup used by every coarse physical stage.
+local function isLandAt(state: State, x: number, z: number): boolean
+	local fm = state.fm
+	local cx, cz = math.floor(x + 0.5), math.floor(z + 0.5)
+	if not FieldMap.inBounds(fm, cx, cz) then
+		return false
+	end
+	local key = cellKey(cx, cz)
+	if FieldMap.hasMask(fm, "coastHalo", key) then
+		return ContinentField.continentAt(fm.config, state.cp, x, z) > 0
+	end
+	return FieldMap.hasMask(fm, "land", key)
+end
+
 local function slopeAt(fm: FieldMap.FieldMap, x: number, z: number): number
 	local function e(cx, cz) return FieldMap.getScalar(fm, "elevHydro", cellKey(cx, cz), fm.config.seaLevel) end
 	local dx = (e(x + 1, z) - e(x - 1, z)) * 0.5
@@ -67,13 +85,15 @@ end
 local function heightAt(state: State, x: number, z: number): number
 	local fm = state.fm
 	local seaLevel = fm.config.seaLevel
-	local cx, cz = math.floor(x + 0.5), math.floor(z + 0.5)
-	local centerLand = isLand(fm, cx, cz)
+	local centerLand = isLandAt(state, x, z)
 	local x0, z0 = math.floor(x), math.floor(z)
 	local fx, fz = x - x0, z - z0
 	local function corner(gx: number, gz: number): number
+		if not FieldMap.inBounds(fm, gx, gz) then
+			return seaLevel
+		end
 		local key = cellKey(gx, gz)
-		if centerLand and not FieldMap.hasMask(fm, "land", key) then
+		if centerLand and not isLandAt(state, gx, gz) then
 			return seaLevel
 		end
 		return FieldMap.getScalar(fm, "elevHydro", key, seaLevel)
@@ -113,19 +133,20 @@ function TerrainField.sampleVoxel(
 	end
 
 	local key = cellKey(cx, cz)
-	local onLand = isLand(fm, cx, cz)
+	local onLand = isLandAt(state, x, z)
 	local height = heightAt(state, x, z)
 	local waterKind: WaterKind? = nil
 	local waterHeight = config.seaLevel
 
 	if onLand then
-		-- All inland water comes from the flux sim's baked depth field (channels are
-		-- already incised into the terrain, so we do NOT carve at render time). Shorelines
-		-- are sub-cell via the bilerp inside WaterSim.sample.
-		local surf, flowing = WaterSim.sample(fm, x, z)
-		if surf ~= nil then
-			waterKind = flowing and "river" or "lake"
-			waterHeight = surf
+		-- WaterSim owns the coarse conservative state; WaterField owns its sparse Terrain-
+		-- column reconstruction. The reconstructed depth also supplies the submerged bed,
+		-- preventing a shallow coarse surface from showing through native water.
+		local water = WaterField.sample(state.waterField, x, z)
+		if water ~= nil then
+			waterKind = water.kind
+			waterHeight = water.surface
+			height = math.min(height, water.surface - water.depth)
 		elseif height <= config.seaLevel then
 			waterKind = "sea"
 			waterHeight = config.seaLevel
@@ -141,7 +162,7 @@ function TerrainField.sampleVoxel(
 		local regime = state.regime.regime[key]
 		local temp = ClimateField.temperatureAt(config, height, cz)
 		local material = RegimeField.materialFor(config, regime, height, temp, slopeAt(fm, cx, cz))
-		-- WaterSim's bilinear footprint extends beyond the coarse river/lake regime mask.
+		-- The sparse footprint extends beyond the coarse river/lake regime mask.
 		-- Every submerged inland sample therefore owns a non-grass bed material directly.
 		if waterKind == "river" or waterKind == "lake" then
 			material = Enum.Material.Mud
@@ -157,7 +178,14 @@ function TerrainField.sampleHeight(config: WorldSpec.Config, state: State, x: nu
 	if not FieldMap.inBounds(fm, cx, cz) then
 		return config.seaLevel - config.waterDepth
 	end
-	return heightAt(state, x, z)
+	local height = heightAt(state, x, z)
+	if isLandAt(state, x, z) then
+		local water = WaterField.sample(state.waterField, x, z)
+		if water ~= nil then
+			return math.min(height, water.surface - water.depth)
+		end
+	end
+	return height
 end
 
 function TerrainField.sampleRegion(config: WorldSpec.Config, state: State, x: number, z: number): string?
@@ -199,6 +227,22 @@ function TerrainField.build(config: WorldSpec.Config, _chunkState: any?): State
 		FieldMap.setScalar(fm, "elevRaw", key, e)
 		FieldMap.setScalar(fm, "elevHydro", key, e)
 	end)
+	-- Mark both sides of every mixed coarse face/diagonal. Analytic continentAt reads are
+	-- confined to this halo; all homogeneous land and sea interiors stay mask-only.
+	local land = fm.mask["land"] or {}
+	local coastHalo = FieldMap.maskField(fm, "coastHalo")
+	local basis = fm.topology.neighbors8
+	for key = 1, fm.topology.count do
+		local keyLand = land[key] == true
+		local base = (key - 1) * 8
+		for slot = base + 1, base + 8 do
+			local neighbor = basis[slot]
+			if neighbor ~= 0 and (land[neighbor] == true) ~= keyLand then
+				coastHalo[key] = true
+				break
+			end
+		end
+	end
 	endStage("macro", stage)
 
 	-- 2) climate
@@ -221,6 +265,9 @@ function TerrainField.build(config: WorldSpec.Config, _chunkState: any?): State
 	stage = startStage()
 	WaterSim.build(config, fm)
 	endStage("waterSim", stage)
+	stage = startStage()
+	local waterField = WaterField.build(config, fm)
+	endStage("waterRasterization", stage)
 	-- 5) biome collapse (reads converged fields)
 	stage = startStage()
 	local regime = RegimeField.build(config, fm)
@@ -231,7 +278,7 @@ function TerrainField.build(config: WorldSpec.Config, _chunkState: any?): State
 	endStage("sites", stage)
 
 	stage = startStage()
-	local state = TerrainField.toState(config, fm, cp, rp, regime, sites, hydro, profileStats)
+	local state = TerrainField.toState(config, fm, cp, rp, regime, sites, waterField, hydro, profileStats)
 	endStage("toState", stage)
 	return state
 end
@@ -244,6 +291,7 @@ function TerrainField.toState(
 	rp: ReliefField.Params,
 	regime: RegimeField.State,
 	sites: SiteField.State,
+	waterField: WaterField.State,
 	hydro: { [string]: number },
 	profileStats: { [string]: number }?
 ): State
@@ -286,6 +334,7 @@ function TerrainField.toState(
 		rp = rp,
 		regime = regime,
 		sites = sites,
+		waterField = waterField,
 		altitudeStats = {
 			min = altitude.min == math.huge and seaLevel or altitude.min,
 			max = altitude.max == -math.huge and seaLevel or altitude.max,
@@ -301,6 +350,12 @@ function TerrainField.toState(
 			seaCells = FieldMap.countMask(fm, "sea"),
 			minLevel = lakeLevels.min == math.huge and seaLevel or lakeLevels.min,
 			maxLevel = lakeLevels.max == -math.huge and seaLevel or lakeLevels.max,
+			renderedLakeArea = waterField.stats.renderedLakeArea or 0,
+			riverMedianWidth = waterField.stats.riverMedianWidth or 0,
+			riverP95Width = waterField.stats.riverP95Width or 0,
+			riverMaxWidth = waterField.stats.riverMaxWidth or 0,
+			lakeMinMaximumDepth = waterField.stats.lakeMinMaximumDepth or 0,
+			lakeMaxMaximumDepth = waterField.stats.lakeMaxMaximumDepth or 0,
 		},
 		featureCounts = {
 			coast = FieldMap.countMask(fm, "coast"),
@@ -385,17 +440,130 @@ function TerrainField.diagnostics(config: WorldSpec.Config, state: State): { [st
 
 	local seaGapOk = minGap >= 2 * cp.wsea
 	local continentsOk = state.sites.bigLandmasses >= 2
+	local waterStats = state.waterField.stats
+	local disconnectedCapsules = WaterField.disconnectedCapsules(config, fm)
+	local expectedLakeBasins = state.macroStats.lakeBasins
+	local lakesContinuous = (waterStats.renderedLakeBasins or 0) == expectedLakeBasins
+		and (waterStats.contiguousLakeBasins or 0) == expectedLakeBasins
+	local coarseLakeArea = FieldMap.countMask(fm, "lake") * config.cellSize * config.cellSize
+	local renderedLakeArea = waterStats.renderedLakeArea or 0
+	local lakeAreaDecrease = if coarseLakeArea > 0 then 1 - renderedLakeArea / coarseLakeArea else 0
 	return {
 		continentCount = state.sites.bigLandmasses,
 		seaGapWidthCells = minGap,
 		seaGapWidthStuds = minGap * config.cellSize,
 		drainageAcyclic = acyclic,
 		lakeSpillVariance = spill,
+		mouthSurfaceError = waterStats.mouthSurfaceError or math.huge,
+		disconnectedRiverCapsules = disconnectedCapsules,
+		lakeAreaDecrease = lakeAreaDecrease,
+		renderedLakeBasins = waterStats.renderedLakeBasins or 0,
+		contiguousLakeBasins = waterStats.contiguousLakeBasins or 0,
 		passedContinents = continentsOk,
 		passedSeaGap = seaGapOk,
 		passedDrainage = acyclic,
 		passedFlatLakes = spill < 1e-6,
-		allPassed = continentsOk and seaGapOk and acyclic and spill < 1e-6,
+		passedMouthPotential = (waterStats.mouthSurfaceError or math.huge) == 0,
+		passedRiverCapsules = disconnectedCapsules == 0,
+		passedLakeContinuity = lakesContinuous,
+		allPassed = continentsOk and seaGapOk and acyclic and spill < 1e-6
+			and (waterStats.mouthSurfaceError or math.huge) == 0
+			and disconnectedCapsules == 0
+			and lakesContinuous,
+	}
+end
+
+-- Voxel-column material audit for reconstructed inland samples. Native Terrain water uses
+-- the returned water kind; the occupied bed sample must never remain Grass.
+function TerrainField.waterMaterialDiagnostics(config: WorldSpec.Config, state: State): { [string]: number }
+	local inlandColumns = 0
+	local grassColumns = 0
+	state.waterField.samples:iter(function(coord: number, _sample: WaterField.Sample)
+		local ix, iz = Hash.splitCellCoord(coord)
+		local x = ((ix + 0.5) * config.voxelResolution) / config.cellSize - 0.5
+		local z = ((iz + 0.5) * config.voxelResolution) / config.cellSize - 0.5
+		local _, _, waterKind, _, material = TerrainField.sampleVoxel(config, state, x, z)
+		if waterKind == "river" or waterKind == "lake" then
+			inlandColumns += 1
+			if material == Enum.Material.Grass then
+				grassColumns += 1
+			end
+		end
+	end)
+	return {
+		inlandWaterColumns = inlandColumns,
+		grassBeneathInlandWater = grassColumns,
+		nativeTerrainWater = if config.waterRenderer == "terrain" then inlandColumns else 0,
+	}
+end
+
+-- Fraction of shoreline contour segments belonging to straight axis-aligned runs at least
+-- 48 studs long, measured once with the coarse mask and once with the coast-halo implicit
+-- boundary. This reads geometry only and performs no Terrain writes.
+function TerrainField.shorelineMetrics(config: WorldSpec.Config, state: State): { [string]: number }
+	local resolution = config.voxelResolution
+	local minimumRun = math.ceil(48 / resolution)
+	local halfWidthStuds = state.fm.halfW * config.cellSize
+	local halfDepthStuds = state.fm.halfD * config.cellSize
+	local minIX = math.floor(-halfWidthStuds / resolution) - 1
+	local maxIX = math.ceil(halfWidthStuds / resolution)
+	local minIZ = math.floor(-halfDepthStuds / resolution) - 1
+	local maxIZ = math.ceil(halfDepthStuds / resolution)
+
+	local function fraction(analytic: boolean): number
+		local total, long = 0, 0
+		local verticalRuns: { number } = table.create(maxIX - minIX + 1, 0)
+		local previousRow: { boolean }? = nil
+		for iz = minIZ, maxIZ do
+			local row: { boolean } = table.create(maxIX - minIX + 1, false)
+			for ix = minIX, maxIX do
+				local x = ((ix + 0.5) * resolution) / config.cellSize - 0.5
+				local z = ((iz + 0.5) * resolution) / config.cellSize - 0.5
+				local cx, cz = math.floor(x + 0.5), math.floor(z + 0.5)
+				local index = ix - minIX + 1
+				row[index] = if analytic then isLandAt(state, x, z)
+					else FieldMap.inBounds(state.fm, cx, cz) and isLand(state.fm, cx, cz)
+			end
+
+			-- Vertical segments at each x face form runs along z.
+			for index = 2, #row do
+				if row[index] ~= row[index - 1] then
+					total += 1
+					verticalRuns[index] += 1
+				else
+					if verticalRuns[index] >= minimumRun then long += verticalRuns[index] end
+					verticalRuns[index] = 0
+				end
+			end
+
+			-- Horizontal segments between successive rows form runs along x.
+			if previousRow ~= nil then
+				local run = 0
+				for index = 1, #row do
+					if row[index] ~= previousRow[index] then
+						total += 1
+						run += 1
+					else
+						if run >= minimumRun then long += run end
+						run = 0
+					end
+				end
+				if run >= minimumRun then long += run end
+			end
+			previousRow = row
+		end
+		for _, run in ipairs(verticalRuns) do
+			if run >= minimumRun then long += run end
+		end
+		return if total > 0 then long / total else 0
+	end
+
+	local coarse = fraction(false)
+	local reconstructed = fraction(true)
+	return {
+		coarseStraightRunFraction = coarse,
+		reconstructedStraightRunFraction = reconstructed,
+		straightRunReduction = if coarse > 0 then 1 - reconstructed / coarse else 0,
 	}
 end
 

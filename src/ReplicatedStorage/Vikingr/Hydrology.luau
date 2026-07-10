@@ -76,6 +76,7 @@ local function clearOutputs(fm: FieldMap.FieldMap)
 	fm.scalar["elevFilled"] = {}
 	fm.scalar["waterLevel"] = {}
 	fm.scalar["basin"] = {}
+	fm.scalar["lakeHeadOriginal"] = {}
 	fm.graph["receiver"] = {}
 	fm.accum["flowAcc"] = {}
 	fm.mask["river"] = {}
@@ -226,8 +227,12 @@ function Hydrology.route(config: WorldSpec.Config, fm: FieldMap.FieldMap, srcFie
 		basinSpill[id] = math.min(basinSpill[id] or math.huge, filled[key] or math.huge)
 	end
 	for key, id in pairs(basin) do
-		FieldMap.setScalar(fm, "waterLevel", key, basinSpill[id] or seaLevel)
+		local spill = basinSpill[id] or seaLevel
+		FieldMap.setScalar(fm, "waterLevel", key, spill)
 		FieldMap.setScalar(fm, "basin", key, id)
+		-- Preserve the signed pre-reconstruction head before channel incision changes the
+		-- coarse bed. WaterField normalizes this shape without changing its zero contour.
+		FieldMap.setScalar(fm, "lakeHeadOriginal", key, spill - (src[key] or seaLevel))
 	end
 	local basinCount = 0
 	for _ in pairs(basinSizes) do basinCount += 1 end

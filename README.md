@@ -19,6 +19,7 @@ Run in Studio:
 ```lua
 require(game.ServerScriptService.Vikingr.Map).Generate()
 require(game.ServerScriptService.Vikingr.Map).BenchScenarios()
+require(game.ServerScriptService.Vikingr.Map).ValidateNaturalWater()
 ```
 
 `Generate()` writes the full voxel map and is intended as an explicit Studio/Edit operation for now. Runtime play startup should use the default no-write bootstrap path so clients do not wait on the full terrain bake.
@@ -52,6 +53,7 @@ Generation is intentionally not run on Play startup. In Studio edit mode, run th
 ```lua
 require(game.ServerScriptService.Vikingr.Map).Generate()
 require(game.ServerScriptService.Vikingr.Map).BenchScenarios()
+require(game.ServerScriptService.Vikingr.Map).ValidateNaturalWater()
 ```
 
 The local `.mcp.json` is deliberately ignored because it contains machine-specific connector paths. It is not required for Rojo or for running the project.

@@ -135,6 +135,22 @@ local function makeVoxelChunk(
 		local occupancyX = {}
 		local worldX = minX + (xi - 0.5) * resolution
 		local cellX = worldX / config.cellSize - 0.5
+		local columns = table.create(zCount)
+		-- Horizontal fields do not depend on Y. Cache each column exactly once before
+		-- assembling its vertical voxels.
+		for zi = 1, zCount do
+			local worldZ = minZ + (zi - 0.5) * resolution
+			local cellZ = worldZ / config.cellSize - 0.5
+			local region, height, waterKind, waterHeight, sampleMaterial =
+				TerrainField.sampleVoxel(config, fieldState, cellX, cellZ)
+			columns[zi] = {
+				region = region,
+				height = height,
+				waterKind = waterKind,
+				waterHeight = waterHeight,
+				sampleMaterial = sampleMaterial,
+			}
+		end
 
 		for yi = 1, yCount do
 			local materialY = {}
@@ -142,9 +158,12 @@ local function makeVoxelChunk(
 			local worldY = minY + (yi - 0.5) * resolution
 
 			for zi = 1, zCount do
-				local worldZ = minZ + (zi - 0.5) * resolution
-				local cellZ = worldZ / config.cellSize - 0.5
-				local region, height, waterKind, waterHeight, sampleMaterial = TerrainField.sampleVoxel(config, fieldState, cellX, cellZ)
+				local column = columns[zi]
+				local region = column.region
+				local height = column.height
+				local waterKind = column.waterKind
+				local waterHeight = column.waterHeight
+				local sampleMaterial = column.sampleMaterial
 				local material = Enum.Material.Air
 				local occupancy = 0
 
@@ -252,6 +271,8 @@ function TerrainWriter.write(config: WorldSpec.Config, state: ChunkStore.State, 
 		voxelsWritten = 0,
 		peakChunkVoxels = 0,
 		markers = 0,
+		voxelAssemblyMs = 0,
+		writeVoxelsMs = 0,
 	}
 
 	local fieldState = providedFieldState or TerrainField.build(config, state)
@@ -281,6 +302,7 @@ function TerrainWriter.write(config: WorldSpec.Config, state: ChunkStore.State, 
 				Vector3.new(minX, minY, minZ),
 				Vector3.new(maxX, maxY, maxZ)
 			):ExpandToGrid(resolution)
+			local assemblyStart = os.clock()
 			local materials, occupancies, voxels = makeVoxelChunk(
 				config,
 				fieldState,
@@ -291,8 +313,11 @@ function TerrainWriter.write(config: WorldSpec.Config, state: ChunkStore.State, 
 				minZ,
 				maxZ
 			)
+			stats.voxelAssemblyMs += (os.clock() - assemblyStart) * 1000
 
+			local writeStart = os.clock()
 			workspace.Terrain:WriteVoxels(region, resolution, materials, occupancies)
+			stats.writeVoxelsMs += (os.clock() - writeStart) * 1000
 			stats.chunks += 1
 			stats.terrainWrites += 1
 			stats.voxelWrites += 1
@@ -304,6 +329,8 @@ function TerrainWriter.write(config: WorldSpec.Config, state: ChunkStore.State, 
 		end
 	end
 	stats.cells = stats.chunks * chunkCells * chunkCells
+	stats.voxelAssemblyMs = math.floor(stats.voxelAssemblyMs * 100 + 0.5) / 100
+	stats.writeVoxelsMs = math.floor(stats.writeVoxelsMs * 100 + 0.5) / 100
 
 	placeSpawn(config, state, fieldState)
 

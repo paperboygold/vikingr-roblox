@@ -53,6 +53,8 @@ function Profiler.RunMapBench(options: { [string]: any }?): { [string]: any }
 		voxelChunkCells = config.voxelChunkCells,
 		buildMs = buildMs,
 		fieldMs = fieldMs,
+		fieldConstructionMs = fieldMs,
+		waterRasterizationMs = fieldState.profileStats.waterRasterization or 0,
 		writeMs = writeMs,
 		totalMs = buildMs + fieldMs + writeMs,
 		landCells = Hash.countKeys(state.land),
@@ -94,6 +96,75 @@ function Profiler.RunScenarioSet(): string
 	end
 
 	return HttpService:JSONEncode(results)
+end
+
+-- Deterministic no-write acceptance suite for the coarse physics and its sparse geometry
+-- descent. The seed list is fixed so results are directly comparable across revisions.
+function Profiler.RunNaturalWaterValidation(): { [string]: any }
+	local seeds = {
+		7920, 7921, 7922, 7923, 7924,
+		7925, 7926, 7927, 7928, 7929,
+		7930, 7931, 7932, 7933, 7934,
+		7935, 7936, 7937, 7938, 7939,
+	}
+	local seedResults = {}
+	local deterministicPassed = true
+	local reference: any = nil
+	for _, seed in ipairs(seeds) do
+		local config = WorldSpec.cloneConfig({ seed = seed })
+		local state = ChunkStore.build(config)
+		local fieldStart = os.clock()
+		local fieldState = TerrainField.build(config, state)
+		local fieldMs = ms(fieldStart)
+		local diagnostics = TerrainField.diagnostics(config, fieldState)
+		local passed = diagnostics.passedContinents
+			and diagnostics.passedSeaGap
+			and diagnostics.passedDrainage
+			and diagnostics.passedFlatLakes
+			and diagnostics.passedMouthPotential
+			and diagnostics.passedRiverCapsules
+		deterministicPassed = deterministicPassed and passed
+		seedResults[#seedResults + 1] = {
+			seed = seed,
+			passed = passed,
+			fieldMs = fieldMs,
+			stages = fieldState.profileStats,
+			diagnostics = diagnostics,
+		}
+		if seed == 7937 then
+			reference = {
+				water = fieldState.waterStats,
+				geometry = fieldState.waterField.stats,
+				diagnostics = diagnostics,
+				materials = TerrainField.waterMaterialDiagnostics(config, fieldState),
+				shoreline = TerrainField.shorelineMetrics(config, fieldState),
+				lakeBasins = fieldState.macroStats.lakeBasins,
+			}
+		end
+	end
+
+	local referencePassed = reference ~= nil
+		and reference.water.riverMedianWidth >= 24
+		and reference.water.riverMedianWidth <= 36
+		and reference.water.riverP95Width <= 64
+		and reference.water.riverMaxWidth >= 52
+		and reference.diagnostics.lakeAreaDecrease >= 0.25
+		and reference.diagnostics.lakeAreaDecrease <= 0.5
+		and reference.lakeBasins == 4
+		and reference.diagnostics.renderedLakeBasins == 4
+		and reference.diagnostics.contiguousLakeBasins == 4
+		and reference.materials.grassBeneathInlandWater == 0
+		and reference.materials.nativeTerrainWater > 0
+		and reference.diagnostics.mouthSurfaceError == 0
+		and reference.shoreline.straightRunReduction >= 0.5
+
+	return {
+		seeds = seedResults,
+		referenceSeed = reference,
+		passedDeterministicSeeds = deterministicPassed,
+		passedReferenceSeed = referencePassed,
+		allPassed = deterministicPassed and referencePassed,
+	}
 end
 
 function Profiler.SceneHealth(): string

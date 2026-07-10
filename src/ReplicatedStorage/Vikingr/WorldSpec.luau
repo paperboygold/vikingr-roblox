@@ -16,8 +16,6 @@ export type Config = {
 	voxelResolution: number,
 	voxelChunkCells: number,
 	coastRampCells: number,
-	riverCount: number,
-	lakeCount: number,
 	terrainMode: string,
 	voxelChunksPerYield: number,
 	waterRenderer: "terrain" | "custom",
@@ -37,8 +35,6 @@ WorldSpec.Config = {
 	voxelResolution = 4,
 	voxelChunkCells = 4,
 	coastRampCells = 14,
-	riverCount = 8,
-	lakeCount = 10,
 	terrainMode = "voxels",
 	voxelChunksPerYield = 4,
 	-- Production water has one owner. "custom" is retained for solver experiments but
@@ -187,7 +183,7 @@ WorldSpec.Tuning = {
 	hydrology = {
 		epsilon = 1e-3, -- priority-flood fill increment (guarantees descending paths)
 		lakeTolerance = 0.15, -- filled-above-raw beyond this → lake cell
-		riverLandFraction = 0.06, -- ~fraction of land channelized into rivers (adaptive threshold)
+		riverLandFraction = 0.035, -- ~fraction of land channelized into rivers (adaptive threshold)
 		riverAccumFloor = 0.05, -- absolute floor on the river threshold (flow units)
 	},
 
@@ -217,24 +213,18 @@ WorldSpec.Tuning = {
 		snowElev = 90, -- fallback snow line if temperature unavailable
 	},
 
-	-- Water rendering: steady-state hydraulic geometry (the O(1) closed-form solution
-	-- of the shallow-water equations) → channel width/depth from discharge, rasterized
-	-- as a continuous footprint so rivers are smooth, not per-cell diagonal blocks.
+	-- Hydraulic geometry reconstructed from the coarse conservative state. Every D8 edge
+	-- becomes a connected capsule at Terrain resolution.
 	water = {
-		widthCoeff = 7.0, -- W (studs) = widthCoeff * discharge^widthExp
+		widthCoeff = 18, -- W (studs) = 18 * sqrt(discharge)
 		widthExp = 0.5,
-		-- minWidth >= ~1.25 cells so even headwater streams span the cell diagonal and
-		-- stay continuous across D8 diagonal steps (a game-legibility floor, not realism).
-		minWidth = 60,
-		maxWidth = 240,
-		depthCoeff = 1.1, -- D (studs) = depthCoeff * discharge^depthExp
-		depthExp = 0.35,
+		minWidth = 12,
+		maxWidth = 72,
+		depthCoeff = 1.7, -- D (studs) = 1.7 * discharge^0.32
+		depthExp = 0.32,
 		minDepth = 2,
-		maxDepth = 16,
-		-- >= 1 cell so a finite signed halo surrounds every channel → clean bilerp, no
-		-- sentinel-corrupted edges.
-		bankMargin = 48,
-		surfaceDrop = 0.4, -- water surface this far below local ground
+		maxDepth = 8,
+		lakeDepthCoeff = 0.15, -- maximum = 0.15 * sqrt(basinArea / pi)
 	},
 
 	-- Shallow-water flux relaxation (the pipe model — erosion's sibling operator).
@@ -244,11 +234,6 @@ WorldSpec.Tuning = {
 	watersim = {
 		-- terrain incision
 		carveDrop = 0.6, -- min bed drop per cell downstream (guarantees descent)
-		carveDepthCoeff = 1.4, -- channel depth (studs) = coeff * discharge^depthExp
-		carveDepthExp = 0.32,
-		carveMinDepth = 3,
-		carveMaxDepth = 20,
-		carveMinRadius = 52, -- >= 1 cell so diagonal corners are carved (no bars)
 		mouthDrop = 3, -- bed at a river mouth sits this far below sea level
 		-- flux relaxation
 		iterations = 60,

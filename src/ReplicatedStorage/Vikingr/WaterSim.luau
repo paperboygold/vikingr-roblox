@@ -3,12 +3,9 @@
 
 -- WaterSim — real shallow-water on the drainage network, in two moves:
 --
---   carve()  — incise the channels into the terrain (elevHydro): a monotone-descending
---              centerline that reaches BELOW sea level at every river mouth (so rivers
---              open to the ocean), widened by discharge with a parabolic cross-section
---              over a >= 1-cell radius (so diagonal steps leave no bar). This is what
---              fixes the "sand dam at the mouth", the "mud bar down the middle", and the
---              grass poking above the water — the water now has a real channel to sit in.
+--   carve()  — incise a monotone coarse centerline that reaches below sea level at every
+--              river mouth. Width and bathymetry descend later through WaterField; the
+--              physical solve remains on this conservative grid.
 --
 --   solve()  — the pipe model (Mei et al. 2007): water depth d and inter-cell flux f
 --              evolved by the schedule-free sweep (erosion's sibling, a B/U flux
@@ -25,16 +22,18 @@ local FieldMap = require(script.Parent.FieldMap)
 local WaterSim = {}
 
 local function channelDepth(config: WorldSpec.Config, Q: number): number
-	local T = WorldSpec.Tuning.watersim
-	return math.clamp(T.carveDepthCoeff * Q ^ T.carveDepthExp, T.carveMinDepth, T.carveMaxDepth)
+	local T = WorldSpec.Tuning.water
+	return math.clamp(T.depthCoeff * Q ^ T.depthExp, T.minDepth, T.maxDepth)
 end
 
 -- ── incise channels into elevHydro ───────────────────────────────────────────
 function WaterSim.carve(config: WorldSpec.Config, fm: FieldMap.FieldMap)
 	local T = WorldSpec.Tuning.watersim
 	local seaLevel = config.seaLevel
-	local cellSize = config.cellSize
 	local b = FieldMap.scalarField(fm, "elevHydro")
+	-- Lake reconstruction needs the bed that produced the basin head, not the later
+	-- channel-incised surface. Keep that coarse physical input immutable.
+	fm.scalar["elevBeforeWater"] = table.clone(b)
 	local filled = fm.scalar["elevFilled"] or {}
 	local receiver = fm.graph["receiver"] or {}
 	local land = fm.mask["land"] or {}
@@ -49,8 +48,6 @@ function WaterSim.carve(config: WorldSpec.Config, fm: FieldMap.FieldMap)
 
 	-- pass 1: monotone descending centerline, reaching below sea at the mouth
 	local maxAllowedSurface: { [FieldMap.CellKey]: number } = {}
-	local centerSurface: { [FieldMap.CellKey]: number } = {}
-	local centerBed: { [FieldMap.CellKey]: number } = {}
 	for _, key in ipairs(rivers) do
 		local Q = FieldMap.getCount(fm, "flowAcc", key)
 		local depth = channelDepth(config, Q)
@@ -66,46 +63,10 @@ function WaterSim.carve(config: WorldSpec.Config, fm: FieldMap.FieldMap)
 			reservoirBoundary[key] = true
 		end
 		local bed = surface - depth
-		centerSurface[key] = surface
-		centerBed[key] = bed
 		b[key] = math.min(b[key] or math.huge, bed)
 		waterDomain[key] = true
 		if recKey ~= nil and land[recKey] then
 			maxAllowedSurface[recKey] = math.min(maxAllowedSurface[recKey] or math.huge, surface - T.carveDrop)
-		end
-	end
-
-	-- pass 2: widen to a parabolic cross-section (deepest at the centerline)
-	for _, key in ipairs(rivers) do
-		local cx, cz = FieldMap.parseKey(key)
-		local Q = FieldMap.getCount(fm, "flowAcc", key)
-		local W = math.clamp(WorldSpec.Tuning.water.widthCoeff * Q ^ WorldSpec.Tuning.water.widthExp,
-			WorldSpec.Tuning.water.minWidth, WorldSpec.Tuning.water.maxWidth)
-		local depth = channelDepth(config, Q)
-		local bed = centerBed[key]
-		local surface = centerSurface[key]
-		local R = math.max(W * 0.5, T.carveMinRadius)
-		local rc = math.ceil(R / cellSize)
-		for dx = -rc, rc do
-			for dz = -rc, rc do
-				local nx, nz = cx + dx, cz + dz
-				if FieldMap.inBounds(fm, nx, nz) then
-					local d = math.sqrt((dx * cellSize) ^ 2 + (dz * cellSize) ^ 2)
-					if d < R then
-						local nk = FieldMap.cellKey(nx, nz)
-						if land[nk] then
-							-- parabola: bed at centre → bed+depth at the bank
-							local target = bed + depth * (d / R) ^ 2
-							if target < (b[nk] or math.huge) then
-								b[nk] = target
-							end
-							if target < surface then
-								waterDomain[nk] = true
-							end
-						end
-					end
-				end
-			end
 		end
 	end
 

@@ -22,6 +22,10 @@ function Map.BenchScenarios(): string
 	return Profiler.RunScenarioSet()
 end
 
+function Map.ValidateNaturalWater(): { [string]: any }
+	return Profiler.RunNaturalWaterValidation()
+end
+
 function Map.SceneHealth(): string
 	return Profiler.SceneHealth()
 end
