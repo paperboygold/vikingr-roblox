@@ -1,0 +1,15 @@
+# Local editor and connector configuration
+.mcp.json
+.vscode/
+.idea/
+
+# Rojo/build output
+*.rbxlx
+*.rbxl
+*.rbxm
+build/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+

@@ -1,0 +1,21 @@
+{
+  "name": "Vikingr",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "Vikingr": {
+        "$path": "src/ReplicatedStorage/Vikingr"
+      }
+    },
+    "ServerScriptService": {
+      "Vikingr": {
+        "$path": "src/ServerScriptService/Vikingr"
+      }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "$path": "src/StarterPlayer/StarterPlayerScripts"
+      }
+    }
+  }
+}
