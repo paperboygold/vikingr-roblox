@@ -1,8 +1,12 @@
 --!strict
 
--- OceanRenderer (client) -- render the conservative ocean field without turning its
--- wet/dry seam into a one-cell mask. Mixed solver triangles are clipped at H = 0, so
--- the visible shoreline is the reconstructed free-surface/terrain intersection.
+-- OceanRenderer (client) — the wave surface, rebased on the universe_live model: the FIELD
+-- is fixed in world space and the observer moves THROUGH it (universe_live.rs: "the camera
+-- IS the observer... flying in reads the same x=B/U at a finer frame"). The MeshPart is
+-- therefore FIXED and only its vertices deform — moving the part per-frame was what stopped
+-- the deformation from rendering (only vertex colours kept updating → a foam crest sliding
+-- over a flat plane). Ocean.luau advances conservative water-column and horizontal
+-- momentum lanes; this mesh reads their free surface and characteristic dissipation.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -13,26 +17,19 @@ local Vikingr = ReplicatedStorage:WaitForChild("Vikingr")
 local Ocean = require(Vikingr:WaitForChild("Ocean"))
 local WorldSpec = require(Vikingr:WaitForChild("WorldSpec"))
 
-local N, SP = 96, 21
+local N, SP = 96, 21 -- 2016 studs, finer shore quantization while keeping startup/mesh cost bounded
 local config = WorldSpec.Config
 local SEA = config.seaLevel
 local HALF = N / 2 * SP
-local CLIP_EPS = 1e-4
 
 local DEEP = Color3.fromRGB(10, 60, 88)
 local MID = Color3.fromRGB(28, 120, 158)
 local FOAM = Color3.fromRGB(238, 248, 252)
 
-type Vertex = { position: number, normal: number, color: number }
-type Edge = { vertex: Vertex? }
-type FaceSlot = { face: number?, a: number?, b: number?, c: number? }
-type TriangleState = { first: FaceSlot, second: FaceSlot }
-
 local rayParams = RaycastParams.new()
 rayParams.IgnoreWater = true
 rayParams.FilterType = Enum.RaycastFilterType.Include
 rayParams.FilterDescendantsInstances = { Workspace.Terrain }
-
 local depthCache: { [string]: number } = {}
 local function depthAt(wx: number, wz: number): number
 	local qx = math.floor(wx + 0.5)
@@ -53,6 +50,7 @@ local function depthAt(wx: number, wz: number): number
 	return depth
 end
 
+-- fixed patch, centred on where the player spawns (the observer moves through it)
 local player = Players.LocalPlayer
 local char = player.Character or player.CharacterAdded:Wait()
 local root = char:WaitForChild("HumanoidRootPart")
@@ -60,26 +58,29 @@ local cx = math.floor(root.Position.X / SP) * SP
 local cz = math.floor(root.Position.Z / SP) * SP
 
 local ocean = Ocean.new({
-	N = N,
-	spacing = SP,
-	seaLevel = SEA,
-	originX = cx - HALF,
-	originZ = cz - HALF,
-	windAngle = 0.5,
-	windStrength = 1.9,
-	referenceDepth = config.waterDepth,
-	depthFn = depthAt,
+	N = N, spacing = SP, seaLevel = SEA,
+	originX = cx - HALF, originZ = cz - HALF,
+	windAngle = 0.5, windStrength = 1.9, depthFn = depthAt,
 })
 _G.VikingrOcean = ocean
 
--- Fade only the displacement at the travelling-patch rim. It is never used to decide
--- whether a cell is wet, because that decision belongs to the conservative state.
+do
+	local mn, mx, sum = 1, 0, 0
+	for _, e in ipairs(ocean.exposure) do
+		mn = math.min(mn, e); mx = math.max(mx, e); sum += e
+	end
+	print(string.format("[Ocean] exposure at spawn patch: min=%.2f max=%.2f mean=%.2f (spatial variation=%s)",
+		mn, mx, sum / #ocean.exposure, tostring(mx - mn > 0.15)))
+end
+
+-- edge fade so the patch melts to a flat rim (seamless against the distant flat base)
 local BORDER = 9
 local fadeArr = {}
 for i = 0, N - 1 do
 	fadeArr[i] = math.clamp(math.min(i, N - 1 - i) / BORDER, 0, 1)
 end
 
+-- horizon haze
 local atmos = game:GetService("Lighting"):FindFirstChildOfClass("Atmosphere")
 if atmos == nil then
 	atmos = Instance.new("Atmosphere")
@@ -90,181 +91,76 @@ atmos.Haze = 1.4
 atmos.Color = Color3.fromRGB(199, 216, 226)
 atmos.Decay = Color3.fromRGB(150, 178, 190)
 
+-- build the mesh once (position / normal / colour ids per vertex)
 local em = ((game:GetService("AssetService") :: any)):CreateEditableMesh()
-local function newVertex(position: Vector3): Vertex
-	return {
-		position = em:AddVertex(position),
-		normal = em:AddNormal(Vector3.yAxis),
-		color = em:AddColor(MID, 0),
-	}
-end
-
-local grid, vertexAt = {}, table.create(N * N)
-local localX, localZ = table.create(N * N), table.create(N * N)
+local pid, nid, cid = {}, {}, {}
+local face1, face2 = {}, {}
 for i = 0, N - 1 do
-	grid[i] = {}
+	pid[i], nid[i], cid[i] = {}, {}, {}
 	for j = 0, N - 1 do
-		local c = i * N + j + 1
-		local x = (i - N / 2) * SP
-		local z = (j - N / 2) * SP
-		local vertex = newVertex(Vector3.new(x, 0, z))
-		grid[i][j] = vertex
-		vertexAt[c] = vertex
-		localX[c], localZ[c] = x, z
+		pid[i][j] = em:AddVertex(Vector3.new((i - N / 2) * SP, 0, (j - N / 2) * SP))
+		nid[i][j] = em:AddNormal(Vector3.yAxis)
+		cid[i][j] = em:AddColor(MID, 1)
 	end
 end
 
--- Edges acquire a render vertex only once they actually contain the moving H=0 contour.
--- This keeps startup and mobile memory tied to shoreline complexity, not patch area.
-local edgeX, edgeZ, edgeDiag = {}, {}, {}
-for i = 0, N - 2 do
-	edgeX[i], edgeDiag[i] = {}, {}
-	for j = 0, N - 1 do
-		edgeX[i][j] = {} :: Edge
-	end
-	for j = 0, N - 2 do
-		edgeDiag[i][j] = {} :: Edge
-	end
-end
-for i = 0, N - 1 do
-	edgeZ[i] = {}
-	for j = 0, N - 2 do
-		edgeZ[i][j] = {} :: Edge
-	end
-end
-
-local function addFace(a: Vertex, b: Vertex, c: Vertex): number
-	local face = em:AddTriangle(a.position, b.position, c.position)
-	em:SetFaceNormals(face, { a.normal, b.normal, c.normal })
-	em:SetFaceColors(face, { a.color, b.color, c.color })
+local function addFace1(i: number, j: number): number
+	local face = em:AddTriangle(pid[i][j], pid[i][j + 1], pid[i + 1][j])
+	em:SetFaceNormals(face, { nid[i][j], nid[i][j + 1], nid[i + 1][j] })
+	em:SetFaceColors(face, { cid[i][j], cid[i][j + 1], cid[i + 1][j] })
 	return face
 end
 
-local tri1, tri2 = {}, {}
-for i = 0, N - 2 do
-	tri1[i], tri2[i] = {}, {}
-	for j = 0, N - 2 do
-		tri1[i][j] = { first = {}, second = {} } :: TriangleState
-		tri2[i][j] = { first = {}, second = {} } :: TriangleState
-	end
+local function addFace2(i: number, j: number): number
+	local face = em:AddTriangle(pid[i][j + 1], pid[i + 1][j + 1], pid[i + 1][j])
+	em:SetFaceNormals(face, { nid[i][j + 1], nid[i + 1][j + 1], nid[i + 1][j] })
+	em:SetFaceColors(face, { cid[i][j + 1], cid[i + 1][j + 1], cid[i + 1][j] })
+	return face
 end
 
--- CreateMeshPartAsync needs one initial face. All actual topology is installed on the
--- first render step and remains editable afterwards.
-local placeholderFace = addFace(grid[0][0], grid[0][1], grid[1][0])
+local initialWet = ocean.wet
+local initialFaceCount = 0
+for i = 0, N - 2 do
+	face1[i], face2[i] = {}, {}
+	for j = 0, N - 2 do
+		local c = i * N + j + 1
+		if initialWet[c] and initialWet[c + 1] and initialWet[c + N] then
+			face1[i][j] = addFace1(i, j)
+			initialFaceCount += 1
+		end
+		if initialWet[c + 1] and initialWet[c + N + 1] and initialWet[c + N] then
+			face2[i][j] = addFace2(i, j)
+			initialFaceCount += 1
+		end
+	end
+end
+local placeholderFace = if initialFaceCount == 0 then addFace1(0, 0) else nil
 local surface = ((game:GetService("AssetService") :: any)):CreateMeshPartAsync(Content.fromObject(em))
-em:RemoveFace(placeholderFace)
+if placeholderFace ~= nil then
+	em:RemoveFace(placeholderFace)
+end
 surface.Name = "Ocean"
 surface.Anchored = true
 surface.CanCollide = false
-surface.CanQuery = false
+surface.CanQuery = false -- CRITICAL: raycasts respect CanQuery, not CanCollide. Without
+	-- this, WaterController's "is there ground under my feet" shore raycast hits the wave
+	-- surface itself (the player floats right at it by design) — a near-zero hit distance
+	-- misreads as "standing on shore" and fires the undebounced shore-exit constantly,
+	-- which is the erratic Freefall/Swimming/GettingUp cycling ("locked up, can't move").
 surface.CastShadow = false
 surface.Material = Enum.Material.SmoothPlastic
 surface.Color = Color3.new(1, 1, 1)
 surface.Transparency = 0
--- The material response exposes the normals already produced by the physical surface;
--- it is not an additional visual wave layer.
-surface.Reflectance = 0.08
 surface.Position = Vector3.new(cx, SEA, cz)
 surface.Parent = Workspace
 
-local surfaceY = table.create(N * N, 0)
-local signedDepth = table.create(N * N, 0)
-local colors = table.create(N * N)
+-- The field is world-locked; the patch (and its full-amplitude CENTRE) follows the player,
+-- so wherever you are in deep water you get full waves (shore stays shoaled/calm). Moving the
+-- MeshPart each frame is fine — the deformation still renders (verified).
+local clamped = table.create(N * N, 0)
+local visible = table.create(N * N, false)
+local coverage = table.create(N * N, 0)
 local depthRefresh = 0
-
-local function ensureEdge(edge: Edge): Vertex
-	if edge.vertex == nil then
-		edge.vertex = newVertex(Vector3.new(0, 0, 0))
-	end
-	return edge.vertex
-end
-
-local function removeSlot(slot: FaceSlot)
-	if slot.face ~= nil then
-		em:RemoveFace(slot.face)
-		slot.face, slot.a, slot.b, slot.c = nil, nil, nil, nil
-	end
-end
-
-local function setSlot(slot: FaceSlot, a: Vertex, b: Vertex, c: Vertex)
-	if slot.face == nil then
-		slot.face = addFace(a, b, c)
-	elseif slot.a ~= a.position or slot.b ~= b.position or slot.c ~= c.position then
-		em:SetFaceVertices(slot.face, { a.position, b.position, c.position })
-		em:SetFaceNormals(slot.face, { a.normal, b.normal, c.normal })
-		em:SetFaceColors(slot.face, { a.color, b.color, c.color })
-	end
-	slot.a, slot.b, slot.c = a.position, b.position, c.position
-end
-
-local function setIntersection(edge: Edge, a: number, b: number): Vertex
-	local vertex = ensureEdge(edge)
-	local pa, pb = signedDepth[a], signedDepth[b]
-	local denom = pa - pb
-	local t = if math.abs(denom) > 1e-12 then math.clamp(pa / denom, 0, 1) else 0.5
-	local x = localX[a] + (localX[b] - localX[a]) * t
-	local y = surfaceY[a] + (surfaceY[b] - surfaceY[a]) * t
-	local z = localZ[a] + (localZ[b] - localZ[a]) * t
-	em:SetPosition(vertex.position, Vector3.new(x, y, z))
-	em:SetNormal(vertex.normal, Vector3.yAxis)
-	em:SetColor(vertex.color, colors[a]:Lerp(colors[b], t))
-	em:SetColorAlpha(vertex.color, 0)
-	return vertex
-end
-
--- Sutherland-Hodgman specialised to one triangle. The two possible output faces are
--- allocated only for the mixed case; no water triangle ever crosses a dry terrain vertex.
-local function clipTriangle(
-	state: TriangleState,
-	a: number,
-	b: number,
-	c: number,
-	edgeAB: Edge,
-	edgeBC: Edge,
-	edgeCA: Edge
-)
-	local inA, inB, inC = signedDepth[a] > 0, signedDepth[b] > 0, signedDepth[c] > 0
-	local count = (if inA then 1 else 0) + (if inB then 1 else 0) + (if inC then 1 else 0)
-	if count == 0 then
-		removeSlot(state.first)
-		removeSlot(state.second)
-		return
-	end
-
-	local va, vb, vc = vertexAt[a], vertexAt[b], vertexAt[c]
-	if count == 3 then
-		setSlot(state.first, va, vb, vc)
-		removeSlot(state.second)
-		return
-	end
-
-	if count == 1 then
-		removeSlot(state.second)
-		if inA then
-			setSlot(state.first, va, setIntersection(edgeAB, a, b), setIntersection(edgeCA, c, a))
-		elseif inB then
-			setSlot(state.first, setIntersection(edgeAB, a, b), vb, setIntersection(edgeBC, b, c))
-		else
-			setSlot(state.first, setIntersection(edgeBC, b, c), vc, setIntersection(edgeCA, c, a))
-		end
-		return
-	end
-
-	if not inA then
-		local iab, ica = setIntersection(edgeAB, a, b), setIntersection(edgeCA, c, a)
-		setSlot(state.first, iab, vb, vc)
-		setSlot(state.second, iab, vc, ica)
-	elseif not inB then
-		local iab, ibc = setIntersection(edgeAB, a, b), setIntersection(edgeBC, b, c)
-		setSlot(state.first, va, iab, ibc)
-		setSlot(state.second, va, ibc, vc)
-	else
-		local ibc, ica = setIntersection(edgeBC, b, c), setIntersection(edgeCA, c, a)
-		setSlot(state.first, va, vb, ibc)
-		setSlot(state.second, va, ibc, ica)
-	end
-end
 
 RunService.Heartbeat:Connect(function(dt)
 	ocean:recenter(math.floor(root.Position.X / SP) * SP - HALF, math.floor(root.Position.Z / SP) * SP - HALF, depthAt)
@@ -275,97 +171,118 @@ RunService.Heartbeat:Connect(function(dt)
 	end
 	surface.Position = Vector3.new(ocean.originX + HALF, SEA, ocean.originZ + HALF)
 	ocean:step(math.min(dt, 1 / 30))
-
 	local h, wet, breaking, groundY = ocean.h, ocean.wet, ocean.breaking, ocean.groundY
-	local water, foam = ocean.water, ocean.foam
-	local wetCount, dryCount, shoreCount = 0, 0, 0
-	local runupCells, foamCells, forcingCells = 0, 0, 0
-	local maxRunupGround, maxFoam, forcingSum = SEA, 0, 0
-	local visiblePeak, visibleTrough = -math.huge, math.huge
+	local wetCount, dryCount = 0, 0
+	local shoreCount = 0
+	local breakingCount, maxBreaking = 0, 0
+	local runupCells, partialCells, maxRunupGround = 0, 0, SEA
 
+	-- pass 1: wet cells carry the solver's free surface directly. Dry cells that
+	-- border water are shoreline boundary vertices: they sit at sea level and fade out,
+	-- rather than pulling the first wet triangle offshore into a visible moat.
 	for i = 0, N - 1 do
-		local rowBase = i * N
+		local rb = i * N
 		local fadeI = fadeArr[i]
 		for j = 0, N - 1 do
-			local c = rowBase + j + 1
-			local H = water[c]
-			local isWet = wet[c]
-			if isWet then
-				wetCount += 1
-				surfaceY[c] = h[c] * fadeI * fadeArr[j]
-				signedDepth[c] = H
-				visiblePeak = math.max(visiblePeak, surfaceY[c])
-				visibleTrough = math.min(visibleTrough, surfaceY[c])
-			else
-				dryCount += 1
-				surfaceY[c] = 0
-				-- A dry exact-waterline sample must stay outside the visible polygon.
-				signedDepth[c] = math.min(SEA - groundY[c], -CLIP_EPS)
-			end
-
-			if isWet and groundY[c] > SEA then
+			local c = rb + j + 1
+			if wet[c] then wetCount += 1 else dryCount += 1 end
+			local hc = h[c] * fadeI * fadeArr[j]
+			local gy = groundY[c]
+			local gxm = if i > 0 then groundY[c - N] else gy
+			local gxp = if i < N - 1 then groundY[c + N] else gy
+			local gzm = if j > 0 then groundY[c - 1] else gy
+			local gzp = if j < N - 1 then groundY[c + 1] else gy
+			local bedRise = math.max(
+				math.abs(gy - gxm),
+				math.abs(gxp - gy),
+				math.abs(gy - gzm),
+				math.abs(gzp - gy)
+			)
+			local H = ocean.water[c]
+			coverage[c] = if H > 0 then H / math.max(H, bedRise) else 0
+			if wet[c] and gy > SEA then
 				runupCells += 1
-				maxRunupGround = math.max(maxRunupGround, groundY[c])
+				maxRunupGround = math.max(maxRunupGround, gy)
 			end
-			local shore = not isWet and ((i > 0 and wet[c - N]) or (i < N - 1 and wet[c + N]) or (j > 0 and wet[c - 1]) or (j < N - 1 and wet[c + 1]))
+			if coverage[c] > 0 and coverage[c] < 1 then
+				partialCells += 1
+			end
+			local shore = not wet[c]
+				and ((i > 0 and wet[c - N])
+					or (i < N - 1 and wet[c + N])
+					or (j > 0 and wet[c - 1])
+					or (j < N - 1 and wet[c + 1]))
 			if shore then
 				shoreCount += 1
+				hc = gy - SEA
+			elseif not wet[c] then
+				hc = gy - SEA
 			end
+			clamped[c] = hc
+			visible[c] = wet[c]
+		end
+	end
 
-			local foamRead = if H > 0 then math.clamp(foam[c] / H, 0, 1) else 0
-			if foamRead > 0.01 then
-				foamCells += 1
-				maxFoam = math.max(maxFoam, foamRead)
+	-- A face exists exactly while all three of its vertices are wet. Mixed faces
+	-- are not merely made transparent: removing them prevents interpolation across land.
+	for i = 0, N - 2 do
+		local rb = i * N
+		for j = 0, N - 2 do
+			local c = rb + j + 1
+			local want1 = wet[c] and wet[c + 1] and wet[c + N]
+			local f1 = face1[i][j]
+			if want1 and f1 == nil then
+				face1[i][j] = addFace1(i, j)
+			elseif not want1 and f1 ~= nil then
+				em:RemoveFace(f1)
+				face1[i][j] = nil
 			end
-			local depthTint = math.clamp(1 - H / 20, 0, 1)
-			colors[c] = DEEP:Lerp(MID, depthTint):Lerp(FOAM, foamRead)
-
-			local forcing = ocean.exposure[c] * ocean.forceWindow[c]
-			forcingSum += forcing
-			if forcing > 0 then
-				forcingCells += 1
+			local want2 = wet[c + 1] and wet[c + N + 1] and wet[c + N]
+			local f2 = face2[i][j]
+			if want2 and f2 == nil then
+				face2[i][j] = addFace2(i, j)
+			elseif not want2 and f2 ~= nil then
+				em:RemoveFace(f2)
+				face2[i][j] = nil
 			end
 		end
 	end
 
 	for i = 0, N - 1 do
-		local rowBase = i * N
+		local rb = i * N
+		local lx = (i - N / 2) * SP
 		for j = 0, N - 1 do
-			local c = rowBase + j + 1
-			local y = surfaceY[c]
-			local ym = (i > 0 and wet[c - N]) and surfaceY[c - N] or y
-			local yp = (i < N - 1 and wet[c + N]) and surfaceY[c + N] or y
-			local zm = (j > 0 and wet[c - 1]) and surfaceY[c - 1] or y
-			local zp = (j < N - 1 and wet[c + 1]) and surfaceY[c + 1] or y
-			local dhx = (yp - ym) / (2 * SP)
-			local dhz = (zp - zm) / (2 * SP)
-			local vertex = vertexAt[c]
-			em:SetPosition(vertex.position, Vector3.new(localX[c], y, localZ[c]))
-			em:SetNormal(vertex.normal, Vector3.new(-dhx, 1, -dhz).Unit)
-			em:SetColor(vertex.color, colors[c])
-			em:SetColorAlpha(vertex.color, 0)
+			local c = rb + j + 1
+			local hc = clamped[c]
+			local hxm = (i > 0 and wet[c - N]) and clamped[c - N] or hc
+			local hxp = (i < N - 1 and wet[c + N]) and clamped[c + N] or hc
+			local hzm = (j > 0 and wet[c - 1]) and clamped[c - 1] or hc
+			local hzp = (j < N - 1 and wet[c + 1]) and clamped[c + 1] or hc
+			local dhx = (hxp - hxm) / (2 * SP)
+			local dhz = (hzp - hzm) / (2 * SP)
+			em:SetPosition(pid[i][j], Vector3.new(lx, hc, (j - N / 2) * SP))
+			em:SetNormal(nid[i][j], Vector3.new(-dhx, 1, -dhz).Unit)
+			local isVisible = visible[c] == true
+			local slope = isVisible and math.sqrt(dhx * dhx + dhz * dhz) or 0
+			local base = DEEP:Lerp(MID, math.clamp((hc + 7) / 13, 0, 1))
+			local alpha = coverage[c]
+			local breaker = wet[c] and (breaking[c] or 0) * fadeArr[i] * fadeArr[j] * alpha or 0
+			if breaker > 0 then
+				breakingCount += 1
+				maxBreaking = math.max(maxBreaking, breaker)
+			end
+			local foam = math.clamp((hc - 2.2) * 0.42 + slope * 3.2 + breaker * 0.9, 0, 1)
+			em:SetColor(cid[i][j], base:Lerp(FOAM, foam))
+			em:SetColorAlpha(cid[i][j], 1 - alpha)
 		end
 	end
-
-	for i = 0, N - 2 do
-		local rowBase = i * N
-		for j = 0, N - 2 do
-			local c = rowBase + j + 1
-			clipTriangle(tri1[i][j], c, c + 1, c + N, edgeZ[i][j], edgeDiag[i][j], edgeX[i][j])
-			clipTriangle(tri2[i][j], c + 1, c + N + 1, c + N, edgeX[i][j + 1], edgeZ[i + 1][j], edgeDiag[i][j])
-		end
-	end
-
 	surface:SetAttribute("oceanPeak", ocean:peak())
 	surface:SetAttribute("wetCells", wetCount)
 	surface:SetAttribute("dryCells", dryCount)
 	surface:SetAttribute("shoreCells", shoreCount)
+	surface:SetAttribute("breakingCells", breakingCount)
+	surface:SetAttribute("maxBreaking", maxBreaking)
 	surface:SetAttribute("runupCells", runupCells)
+	surface:SetAttribute("partialCoverageCells", partialCells)
 	surface:SetAttribute("maxRunupGround", maxRunupGround)
-	surface:SetAttribute("foamCells", foamCells)
-	surface:SetAttribute("maxFoam", maxFoam)
-	surface:SetAttribute("forcingCells", forcingCells)
-	surface:SetAttribute("meanForcing", forcingSum / (N * N))
-	surface:SetAttribute("visiblePeak", visiblePeak == -math.huge and 0 or visiblePeak)
-	surface:SetAttribute("visibleTrough", visibleTrough == math.huge and 0 or visibleTrough)
 end)
