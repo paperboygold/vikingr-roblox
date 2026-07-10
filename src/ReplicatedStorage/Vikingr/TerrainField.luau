@@ -141,6 +141,11 @@ function TerrainField.sampleVoxel(
 		local regime = state.regime.regime[key]
 		local temp = ClimateField.temperatureAt(config, height, cz)
 		local material = RegimeField.materialFor(config, regime, height, temp, slopeAt(fm, cx, cz))
+		-- WaterSim's bilinear footprint extends beyond the coarse river/lake regime mask.
+		-- Every submerged inland sample therefore owns a non-grass bed material directly.
+		if waterKind == "river" or waterKind == "lake" then
+			material = Enum.Material.Mud
+		end
 		return (regime or "land"), height, waterKind, waterHeight, material
 	end
 	return "seabed", height, waterKind, waterHeight, seabedMaterialFor(config, height)

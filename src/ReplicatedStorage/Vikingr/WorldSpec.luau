@@ -256,7 +256,6 @@ WorldSpec.Tuning = {
 		gravity = 9.8,
 		pipeArea = 18,
 		fluxDamp = 0.92,
-		minRenderDepth = 0.5, -- studs; thinner sheets are not drawn
 		flowThreshold = 6, -- flux magnitude above which water is drawn as "river" (flowing)
 	},
 

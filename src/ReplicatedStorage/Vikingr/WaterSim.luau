@@ -38,26 +38,40 @@ function WaterSim.carve(config: WorldSpec.Config, fm: FieldMap.FieldMap)
 	local filled = fm.scalar["elevFilled"] or {}
 	local receiver = fm.graph["receiver"] or {}
 	local land = fm.mask["land"] or {}
+	fm.mask["waterDomain"] = {}
+	fm.mask["reservoirBoundary"] = {}
+	local waterDomain = fm.mask["waterDomain"]
+	local reservoirBoundary = fm.mask["reservoirBoundary"]
 
 	-- downstream order (highest filled first)
 	local rivers = FieldMap.maskKeys(fm, "river")
 	table.sort(rivers, function(a, c) return (filled[a] or 0) > (filled[c] or 0) end)
 
 	-- pass 1: monotone descending centerline, reaching below sea at the mouth
-	local maxAllowed: { [FieldMap.CellKey]: number } = {}
+	local maxAllowedSurface: { [FieldMap.CellKey]: number } = {}
+	local centerSurface: { [FieldMap.CellKey]: number } = {}
 	local centerBed: { [FieldMap.CellKey]: number } = {}
 	for _, key in ipairs(rivers) do
-		local cur = math.min(b[key] or seaLevel, maxAllowed[key] or math.huge)
+		local Q = FieldMap.getCount(fm, "flowAcc", key)
+		local depth = channelDepth(config, Q)
+		local surface = math.min(b[key] or seaLevel, maxAllowedSurface[key] or math.huge)
 		local rec = receiver[key]
 		local recKey = rec ~= nil and rec[1] or nil
 		local toSea = recKey == nil or not land[recKey]
 		if toSea then
-			cur = math.min(cur, seaLevel - T.mouthDrop) -- open the mouth to the ocean
+			-- The river and ocean share one free surface at the mouth. Depth belongs below
+			-- that surface; lowering the surface itself creates a visible notch or dam.
+			surface = seaLevel
+			depth = math.max(depth, T.mouthDrop)
+			reservoirBoundary[key] = true
 		end
-		centerBed[key] = cur
-		b[key] = cur
+		local bed = surface - depth
+		centerSurface[key] = surface
+		centerBed[key] = bed
+		b[key] = math.min(b[key] or math.huge, bed)
+		waterDomain[key] = true
 		if recKey ~= nil and land[recKey] then
-			maxAllowed[recKey] = math.min(maxAllowed[recKey] or math.huge, cur - T.carveDrop)
+			maxAllowedSurface[recKey] = math.min(maxAllowedSurface[recKey] or math.huge, surface - T.carveDrop)
 		end
 	end
 
@@ -69,6 +83,7 @@ function WaterSim.carve(config: WorldSpec.Config, fm: FieldMap.FieldMap)
 			WorldSpec.Tuning.water.minWidth, WorldSpec.Tuning.water.maxWidth)
 		local depth = channelDepth(config, Q)
 		local bed = centerBed[key]
+		local surface = centerSurface[key]
 		local R = math.max(W * 0.5, T.carveMinRadius)
 		local rc = math.ceil(R / cellSize)
 		for dx = -rc, rc do
@@ -76,7 +91,7 @@ function WaterSim.carve(config: WorldSpec.Config, fm: FieldMap.FieldMap)
 				local nx, nz = cx + dx, cz + dz
 				if FieldMap.inBounds(fm, nx, nz) then
 					local d = math.sqrt((dx * cellSize) ^ 2 + (dz * cellSize) ^ 2)
-					if d <= R then
+					if d < R then
 						local nk = FieldMap.cellKey(nx, nz)
 						if land[nk] then
 							-- parabola: bed at centre → bed+depth at the bank
@@ -84,11 +99,19 @@ function WaterSim.carve(config: WorldSpec.Config, fm: FieldMap.FieldMap)
 							if target < (b[nk] or math.huge) then
 								b[nk] = target
 							end
+							if target < surface then
+								waterDomain[nk] = true
+							end
 						end
 					end
 				end
 			end
 		end
+	end
+
+	-- Lake basins are part of the same admissible water domain as channels.
+	for _, key in ipairs(FieldMap.maskKeys(fm, "lake")) do
+		waterDomain[key] = true
 	end
 end
 
@@ -110,36 +133,52 @@ function WaterSim.solve(config: WorldSpec.Config, fm: FieldMap.FieldMap)
 		seed[key] = math.max(seed[key] or 0, channelDepth(config, FieldMap.getCount(fm, "flowAcc", key)))
 	end
 
-	-- The relaxation is many sweeps over the same topology. Collapse coordinates to
-	-- a basis once; off-map neighbors are the explicit sea sink key 0.
-	local landList = FieldMap.maskKeys(fm, "land")
-	local cellCount = #landList
+	-- The relaxation is many sweeps over the same topology. Only carved channel and lake
+	-- cells participate. `0` is a sea sink; `-1` is a solid bank with zero face flux.
+	local domainList = FieldMap.maskKeys(fm, "waterDomain")
+	local cellCount = #domainList
 	local indexByKey: { [FieldMap.CellKey]: number } = {}
 	local xByIndex: { number } = table.create(cellCount)
 	local zByIndex: { number } = table.create(cellCount)
 	local bed: { number } = table.create(cellCount)
 	local depth: { number } = table.create(cellCount)
 	local sourceFloor: { number? } = table.create(cellCount)
-	for i, key in ipairs(landList) do
+	local fixedSurface: { number? } = table.create(cellCount)
+	local reservoirBoundary = fm.mask["reservoirBoundary"] or {}
+	for i, key in ipairs(domainList) do
 		indexByKey[key] = i
 		local cx, cz = FieldMap.parseKey(key)
 		xByIndex[i] = cx
 		zByIndex[i] = cz
 		bed[i] = b[key] or seaLevel
-		local source = seed[key]
-		sourceFloor[i] = source
-		depth[i] = source or 0
+		if reservoirBoundary[key] then
+			fixedSurface[i] = seaLevel
+			depth[i] = math.max(0, seaLevel - bed[i])
+		else
+			local source = seed[key]
+			sourceFloor[i] = source
+			depth[i] = source or 0
+		end
 	end
 
 	local east: { number } = table.create(cellCount)
 	local west: { number } = table.create(cellCount)
 	local north: { number } = table.create(cellCount)
 	local south: { number } = table.create(cellCount)
+	local land = fm.mask["land"] or {}
 	local function neighborIndex(x: number, z: number): number
-		if FieldMap.inBounds(fm, x, z) then
-			return indexByKey[FieldMap.cellKey(x, z)] or 0
+		if not FieldMap.inBounds(fm, x, z) then
+			return 0
 		end
-		return 0
+		local key = FieldMap.cellKey(x, z)
+		local index = indexByKey[key]
+		if index ~= nil then
+			return index
+		end
+		if not land[key] then
+			return 0
+		end
+		return -1
 	end
 	for i = 1, cellCount do
 		local cx, cz = xByIndex[i], zByIndex[i]
@@ -160,10 +199,10 @@ function WaterSim.solve(config: WorldSpec.Config, fm: FieldMap.FieldMap)
 		for i = 1, cellCount do
 			local sc = bed[i] + depth[i]
 			local ei, wi, ni, si = east[i], west[i], north[i], south[i]
-			local se = if ei ~= 0 then bed[ei] + depth[ei] else seaLevel
-			local sw = if wi ~= 0 then bed[wi] + depth[wi] else seaLevel
-			local sn = if ni ~= 0 then bed[ni] + depth[ni] else seaLevel
-			local ss = if si ~= 0 then bed[si] + depth[si] else seaLevel
+			local se = if ei > 0 then bed[ei] + depth[ei] elseif ei == 0 then seaLevel else sc
+			local sw = if wi > 0 then bed[wi] + depth[wi] elseif wi == 0 then seaLevel else sc
+			local sn = if ni > 0 then bed[ni] + depth[ni] elseif ni == 0 then seaLevel else sc
+			local ss = if si > 0 then bed[si] + depth[si] elseif si == 0 then seaLevel else sc
 			local e = fluxE[i] * damp + accel * (sc - se)
 			local w = fluxW[i] * damp + accel * (sc - sw)
 			local n = fluxN[i] * damp + accel * (sc - sn)
@@ -198,15 +237,22 @@ function WaterSim.solve(config: WorldSpec.Config, fm: FieldMap.FieldMap)
 		-- depth pass (reads flux, writes d)
 		for i = 1, cellCount do
 			local ei, wi, ni, si = east[i], west[i], north[i], south[i]
-			local inflow = (if ei ~= 0 then fluxW[ei] else 0)
-				+ (if wi ~= 0 then fluxE[wi] else 0)
-				+ (if ni ~= 0 then fluxS[ni] else 0)
-				+ (if si ~= 0 then fluxN[si] else 0)
+			local inflow = (if ei > 0 then fluxW[ei] else 0)
+				+ (if wi > 0 then fluxE[wi] else 0)
+				+ (if ni > 0 then fluxS[ni] else 0)
+				+ (if si > 0 then fluxN[si] else 0)
 			local outflow = fluxE[i] + fluxW[i] + fluxN[i] + fluxS[i]
 			local nd = depth[i] + dt * (inflow - outflow) / area
-			local source = sourceFloor[i]
-			if source ~= nil and nd < source then
-				nd = source -- pinned source floor
+			local boundarySurface = fixedSurface[i]
+			if boundarySurface ~= nil then
+				-- A reservoir boundary prescribes exterior potential, so the boundary
+				-- cell cannot accumulate above or drain below that equilibrium surface.
+				nd = math.max(0, boundarySurface - bed[i])
+			else
+				local source = sourceFloor[i]
+				if source ~= nil and nd < source then
+					nd = source -- pinned source floor
+				end
 			end
 			if nd < 0 then
 				nd = 0
@@ -220,7 +266,7 @@ function WaterSim.solve(config: WorldSpec.Config, fm: FieldMap.FieldMap)
 	local surface: { [FieldMap.CellKey]: number } = {}
 	local velX: { [FieldMap.CellKey]: number } = {}
 	local velZ: { [FieldMap.CellKey]: number } = {}
-	for i, key in ipairs(landList) do
+	for i, key in ipairs(domainList) do
 		d[key] = depth[i]
 		surface[key] = bed[i] + depth[i]
 		velX[key] = fluxE[i] - fluxW[i]
@@ -240,13 +286,42 @@ end
 -- Returns (surfaceElevation, isFlowing) if under water, else nil.
 function WaterSim.sample(fm: FieldMap.FieldMap, x: number, z: number): (number?, boolean)
 	local T = WorldSpec.Tuning.watersim
-	local depth = FieldMap.bilerpScalar(fm, "waterDepth", x, z, 0)
-	if depth <= T.minRenderDepth then
+	local x0, z0 = math.floor(x), math.floor(z)
+	local fx, fz = x - x0, z - z0
+	local w00 = (1 - fx) * (1 - fz)
+	local w10 = fx * (1 - fz)
+	local w01 = (1 - fx) * fz
+	local w11 = fx * fz
+	local k00 = FieldMap.cellKey(x0, z0)
+	local k10 = FieldMap.cellKey(x0 + 1, z0)
+	local k01 = FieldMap.cellKey(x0, z0 + 1)
+	local k11 = FieldMap.cellKey(x0 + 1, z0 + 1)
+	local depths = fm.scalar["waterDepth"] or {}
+	local d00, d10 = depths[k00] or 0, depths[k10] or 0
+	local d01, d11 = depths[k01] or 0, depths[k11] or 0
+	local depth = d00 * w00 + d10 * w10 + d01 * w01 + d11 * w11
+	if depth <= 0 then
 		return nil, false
 	end
-	local surf = FieldMap.bilerpScalar(fm, "waterSurface", x, z, fm.config.seaLevel)
-	local vx = FieldMap.bilerpScalar(fm, "flowVelX", x, z, 0)
-	local vz = FieldMap.bilerpScalar(fm, "flowVelZ", x, z, 0)
+
+	-- Normalize potential over wet support. Dry corners contribute zero depth but no
+	-- artificial exterior potential, so a flat lake remains flat up to its wet/dry face.
+	local surfaces = fm.scalar["waterSurface"] or {}
+	local sw00, sw10 = if d00 > 0 then w00 else 0, if d10 > 0 then w10 else 0
+	local sw01, sw11 = if d01 > 0 then w01 else 0, if d11 > 0 then w11 else 0
+	local wetWeight = sw00 + sw10 + sw01 + sw11
+	local surf = (
+		(surfaces[k00] or fm.config.seaLevel) * sw00
+		+ (surfaces[k10] or fm.config.seaLevel) * sw10
+		+ (surfaces[k01] or fm.config.seaLevel) * sw01
+		+ (surfaces[k11] or fm.config.seaLevel) * sw11
+	) / wetWeight
+	local velX = fm.scalar["flowVelX"] or {}
+	local velZ = fm.scalar["flowVelZ"] or {}
+	local vx = (velX[k00] or 0) * w00 + (velX[k10] or 0) * w10
+		+ (velX[k01] or 0) * w01 + (velX[k11] or 0) * w11
+	local vz = (velZ[k00] or 0) * w00 + (velZ[k10] or 0) * w10
+		+ (velZ[k01] or 0) * w01 + (velZ[k11] or 0) * w11
 	local flowing = (vx * vx + vz * vz) > (T.flowThreshold * T.flowThreshold)
 	return surf, flowing
 end
